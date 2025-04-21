@@ -6,33 +6,97 @@ import re
 from datetime import datetime, timedelta
 import json
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify,Response
+
+'''
+capture all status - amended, cancelled and confirmed 
+"ehxe srtr fkuc iojk") #find in "app password" Security from Gmail Account
+Check only upcoming reservations (checkin date > = today)
+'''
+
+''' FOR Future Enhancement ONLY
+# Project: Agoda Email Reservation Extractor (Simplified)
+
+This is a simplified Flask-based Web API that:
+- Connects to Gmail
+- Parses Agoda reservation confirmation emails
+- Extracts structured reservation data
+- Saves the result as JSON
+- Tracks last scan time to avoid duplication
+
+## Folder Structure (Simplified)
+
+```
+email_scraper/
+├── main.py               # Entry point, contains Flask app & logic
+├── data/
+│   ├── last_scan_time.txt
+│   └── reservations.json
+├── credentials.json      # Gmail API credentials
+├── token.json            # Gmail API token (generated after first login)
+├── templates/            # (Optional) For future front-end
+└── requirements.txt
+```
+
+## How to Use
+
+1. Install requirements:
+```bash
+pip install -r requirements.txt
+```
+
+2. Run the app:
+```bash
+python main.py
+```
+
+3. Access API endpoints:
+- `GET /reservations` → Incremental scan
+- `GET /reservations?mode=reset` → Rescan 365 days
+- `GET /reservations?mode=range&start=YYYY-MM-DD&end=YYYY-MM-DD` → Custom range
+
+4. test
+http://localhost:5000/scan-emails for incremental scan
+http://localhost:5000/scan-emails?mode=reset to reset and scan all from 365 days
+http://localhost:5000/scan-emails?mode=range&start=2024-12-01&end=2025-01-01 to define a custom scan window
+'''
 
 app = Flask(__name__)
 
 @app.route("/scan-emails", methods=["POST","GET"])
+
 def scan_emails():
-    timestamp_file = "last_scan_time.txt"
+    output_dir = "data"
+    timestamp_file = os.path.join(output_dir, "last_scan_time.txt")
     now = datetime.now()
     previous_scan_time = now - timedelta(days=365)
 
-    # Determine scan range
-    reset_param = request.args.get("reset")
-    if reset_param:
-        try:
-            if reset_param.isdigit():
-                previous_scan_time = now - timedelta(days=int(reset_param))
-            else:
-                previous_scan_time = datetime.strptime(reset_param, "%Y-%m-%d")
-        except Exception:
+    # Get platform, mode and optional parameters
+    platform = request.args.get("platform").capitalize()
+    mode = request.args.get("mode")
+    start_date = request.args.get("start")
+    end_date = request.args.get("end")
+
+    try:
+        if mode == "reset":
             previous_scan_time = now - timedelta(days=365)
-    elif os.path.exists(timestamp_file):
-        with open(timestamp_file, "r") as f:
-            last_scan_str = f.read().strip()
-        try:
+
+        elif mode == "range" and start_date and end_date:
+            previous_scan_time = datetime.strptime(start_date, "%Y-%m-%d")
+            end_time = datetime.strptime(end_date, "%Y-%m-%d")
+            if end_time < now:
+                now = end_time  # override scan-to time
+
+        elif os.path.exists(timestamp_file):
+            with open(timestamp_file, "r") as f:
+                last_scan_str = f.read().strip()
             previous_scan_time = datetime.strptime(last_scan_str, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            previous_scan_time = now - timedelta(days=365)
+
+    except Exception as e:
+        print("Error parsing dates:", e)
+        previous_scan_time = now - timedelta(days=365)
+
+    print(f"⏱️ Scanning emails from {previous_scan_time} to {now}")
 
     # Set up IMAP
     imap = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -149,7 +213,7 @@ def scan_emails():
             if occupancy:
                 occupancy = occupancy.strip()
                 adult_match = re.search(r'(\d+)\s*Adult', occupancy, re.IGNORECASE)
-                kid_match = re.search(r'(\d+)\s*Children', occupancy, re.IGNORECASE)
+                kid_match = re.search(r'(\d+)\s*Child', occupancy, re.IGNORECASE)
                 if adult_match:
                     adults = int(adult_match.group(1))
                 if kid_match:
@@ -181,6 +245,7 @@ def scan_emails():
                 continue
 
             reservation = {
+                "Platform": platform,
                 "Booking ID": booking_id,
                 "Guest Name": guest_name,
                 "Total Price": total_price,
@@ -198,10 +263,12 @@ def scan_emails():
                 "Status": status
             }
 
-            if booking_id:
-                existing = reservation_dict.get(booking_id)
-                if not existing or last_updated_dt > datetime.strptime(existing["Last Updated Time"], "%Y-%m-%d %H:%M:%S"):
-                    reservation_dict[booking_id] = reservation
+            reservation_dict[booking_id] = reservation
+            #quite slow when comparing to retrieve the only the lastest change
+            # if booking_id:
+            #     existing = reservation_dict.get(booking_id)
+            #     if not existing or last_updated_dt > datetime.strptime(existing["Last Updated Time"], "%Y-%m-%d %H:%M:%S"):
+            #         reservation_dict[booking_id] = reservation
 
     imap.logout()
 
@@ -209,12 +276,12 @@ def scan_emails():
         f.write(now.strftime("%Y-%m-%d %H:%M:%S"))
 
     reservations = list(reservation_dict.values())
-    output_dir = "output"
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "reservations.json"), "w", encoding="utf-8") as f:
         json.dump(reservations, f, indent=2, ensure_ascii=False)
 
-    return jsonify({"reservations": reservations, "count": len(reservations)})
+    json_response = json.dumps({"reservations": reservations, "count": len(reservations)}, ensure_ascii=False)
+    return Response(json_response, mimetype="application/json; charset=utf-8")
 
 if __name__ == "__main__":
     app.run(debug=True)
